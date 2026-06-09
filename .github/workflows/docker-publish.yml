@@ -51,7 +51,7 @@ jobs:
           images: ${{ env.OLLAMA_IMAGE }}
           tags: |
             type=raw,value=${{ needs.resolve-version.outputs.version }}
-            type=raw,value=latest,enable={{ is_default_branch }}
+            type=raw,value=latest
       - uses: docker/build-push-action@v6
         with:
           context: ./openvino
@@ -82,7 +82,7 @@ jobs:
           images: ${{ env.IMPORTER_IMAGE }}
           tags: |
             type=raw,value=${{ needs.resolve-version.outputs.version }}
-            type=raw,value=latest,enable={{ is_default_branch }}
+            type=raw,value=latest
       - uses: docker/build-push-action@v6
         with:
           context: ./importer
