@@ -9,7 +9,6 @@ import (
 	"html/template"
 	"io"
 	"log"
-	"mime/multipart"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -184,6 +183,8 @@ form.addEventListener("submit", async (e) => {
     }
 
     setStatus("Finalizing and importing into Ollama…");
+    const fr = await fetch("/jobs/" + job.id + "/finalize", { method: "POST" });
+    if (!fr.ok && fr.status !== 202) throw new Error("finalize failed: HTTP " + fr.status);
     const done = await pollJob(job.id);
     setStatus('<div class="alert ok">Imported <code>' + done.name + '</code></div>', "ok");
   } catch (err) {
@@ -540,18 +541,25 @@ func deriveModelName(mf, fallback string) string {
 }
 
 func ollamaCreate(name, modelfile string) error {
-	body := &bytes.Buffer{}
-	mw := multipart.NewWriter(body)
-	_ = mw.WriteField("name", name)
-	_ = mw.WriteField("modelfile", modelfile)
-	_ = mw.WriteField("stream", "false")
-	_ = mw.Close()
+	stream := false
+	reqBody := map[string]any{
+		"model":     name,
+		"modelfile": modelfile,
+		"stream":    &stream,
+	}
+	for k, v := range parseOpenVINOFields(modelfile) {
+		reqBody[k] = v
+	}
 
-	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(ollamaURL, "/")+"/api/create", body)
+	body, err := json.Marshal(reqBody)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(ollamaURL, "/")+"/api/create", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -563,6 +571,34 @@ func ollamaCreate(name, modelfile string) error {
 		return fmt.Errorf("%s: %s", resp.Status, string(respBody))
 	}
 	return nil
+}
+
+// parseOpenVINOFields lifts the OpenVINO-specific Modelfile directives into
+// top-level JSON fields expected by the ollama_openvino fork's /api/create.
+func parseOpenVINOFields(mf string) map[string]string {
+	out := map[string]string{}
+	for _, line := range strings.Split(mf, "\n") {
+		t := strings.TrimSpace(line)
+		if t == "" || strings.HasPrefix(t, "#") {
+			continue
+		}
+		idx := strings.IndexAny(t, " \t")
+		if idx < 0 {
+			continue
+		}
+		key := strings.ToUpper(strings.TrimSpace(t[:idx]))
+		val := strings.TrimSpace(t[idx+1:])
+		val = strings.Trim(val, "\"'")
+		switch key {
+		case "MODELBACKEND":
+			out["modelbackend"] = val
+		case "MODELTYPE":
+			out["modeltype"] = val
+		case "INFERDEVICE":
+			out["inferdevice"] = val
+		}
+	}
+	return out
 }
 
 func sanitizeName(s string) string {
