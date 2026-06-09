@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -460,7 +461,7 @@ func assembleAndImport(j *job) error {
 		return err
 	}
 
-	// Stage into the shared volume visible to the ollama container.
+	// Stage into the shared volume visible to the ollama container (handy for debugging).
 	stagedDir := filepath.Join(modelsInOll, sanitizeName(stripExt(j.Filename)))
 	if err := os.MkdirAll(stagedDir, 0o755); err != nil {
 		return err
@@ -470,7 +471,22 @@ func assembleAndImport(j *job) error {
 		return err
 	}
 
-	// Resolve model name
+	// Compute sha256 of the staged file (Ollama's blob store is content-addressed).
+	digest, err := sha256File(staged)
+	if err != nil {
+		return fmt.Errorf("hash: %w", err)
+	}
+	jobsMu.Lock()
+	j.Message = "uploading blob " + digest[:12] + "…"
+	jobsMu.Unlock()
+
+	// Push the file as a blob into Ollama. Idempotent: Ollama returns 200/201
+	// if the blob already exists, or 4xx if the digest mismatches.
+	if err := ollamaPushBlob(digest, staged); err != nil {
+		return fmt.Errorf("push blob: %w", err)
+	}
+
+	// Resolve model name.
 	name := j.Name
 	if name == "" {
 		name = deriveModelName(j.Modelfile, j.Filename)
@@ -478,12 +494,15 @@ func assembleAndImport(j *job) error {
 	if name == "" {
 		return fmt.Errorf("could not derive model name; add '# model: name:tag' to the Modelfile or set the name field")
 	}
+	j.Name = name
 
-	rewritten := rewriteFrom(j.Modelfile, staged)
-	if err := ollamaCreate(name, rewritten); err != nil {
+	jobsMu.Lock()
+	j.Message = "creating model " + name + "…"
+	jobsMu.Unlock()
+
+	if err := ollamaCreate(name, j.Filename, digest, j.Modelfile); err != nil {
 		return err
 	}
-	j.Name = name
 	return nil
 }
 
@@ -540,22 +559,25 @@ func deriveModelName(mf, fallback string) string {
 	return base + ":latest"
 }
 
-func ollamaCreate(name, modelfile string) error {
+func ollamaCreate(name, filename, digest, modelfile string) error {
 	stream := false
-	reqBody := map[string]any{
-		"model":     name,
-		"modelfile": modelfile,
-		"stream":    &stream,
+	body := map[string]any{
+		"model":  name,
+		"stream": &stream,
+		"files":  map[string]string{filename: digest},
 	}
 	for k, v := range parseOpenVINOFields(modelfile) {
-		reqBody[k] = v
+		body[k] = v
+	}
+	if params := parseParameters(modelfile); len(params) > 0 {
+		body["parameters"] = params
 	}
 
-	body, err := json.Marshal(reqBody)
+	raw, err := json.Marshal(body)
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(ollamaURL, "/")+"/api/create", bytes.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(ollamaURL, "/")+"/api/create", bytes.NewReader(raw))
 	if err != nil {
 		return err
 	}
@@ -599,6 +621,99 @@ func parseOpenVINOFields(mf string) map[string]string {
 		}
 	}
 	return out
+}
+
+// parseParameters collects PARAMETER <key> <value> lines into a map suitable
+// for the `parameters` field of api.CreateRequest. Numeric values are decoded
+// as JSON numbers (int or float) so Ollama's reflection-based type coercion
+// receives the correct Go type.
+func parseParameters(mf string) map[string]any {
+	out := map[string]any{}
+	for _, line := range strings.Split(mf, "\n") {
+		t := strings.TrimSpace(line)
+		if t == "" || strings.HasPrefix(t, "#") {
+			continue
+		}
+		idx := strings.IndexAny(t, " \t")
+		if idx < 0 {
+			continue
+		}
+		key := strings.ToUpper(strings.TrimSpace(t[:idx]))
+		if key != "PARAMETER" {
+			continue
+		}
+		rest := strings.TrimSpace(t[idx+1:])
+		sp := strings.IndexAny(rest, " \t")
+		if sp < 0 {
+			continue
+		}
+		pk := rest[:sp]
+		pv := strings.TrimSpace(rest[sp+1:])
+		pv = strings.Trim(pv, "\"'")
+		out[strings.ToLower(pk)] = coerceNumber(pv)
+	}
+	return out
+}
+
+// coerceNumber returns v as an int64 or float64 if it parses as a number,
+// otherwise the original string. Used for PARAMETER values that may be
+// booleans, integers, or floats.
+func coerceNumber(v string) any {
+	if v == "" {
+		return v
+	}
+	if i, err := strconv.ParseInt(v, 10, 64); err == nil {
+		return i
+	}
+	if f, err := strconv.ParseFloat(v, 64); err == nil {
+		return f
+	}
+	switch strings.ToLower(v) {
+	case "true":
+		return true
+	case "false":
+		return false
+	}
+	return v
+}
+
+func ollamaPushBlob(digest, path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	url := strings.TrimRight(ollamaURL, "/") + "/api/blobs/" + digest
+	req, err := http.NewRequest(http.MethodPost, url, f)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("%s: %s", resp.Status, string(body))
+	}
+	return nil
+}
+
+func sha256File(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return "sha256-" + hex.EncodeToString(h.Sum(nil)), nil
 }
 
 func sanitizeName(s string) string {
