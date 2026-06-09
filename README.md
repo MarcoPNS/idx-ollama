@@ -21,9 +21,10 @@ The bundled `docker-compose.yaml` already pulls `marcospace/idx-ollama-openvino:
 Open `http://<nas-ip>:3161` in a browser:
 
 1. (Optional) Enter a model name, e.g. `DeepSeek-R1-Distill-Qwen-7B-int4-ov:v1`. If empty, the importer uses the first `# model: name:tag` line of the Modelfile, or falls back to the tar.gz filename.
-2. Pick the model `*.tar.gz` (and any sibling files referenced by `FROM`).
-3. Paste the Modelfile contents (or upload it as a file). Example:
-
+2. For a list of compatible models see [zhaohb/ollama_openvino Readme](https://github.com/zhaohb/ollama_openvino#model-library-vlm)
+3. Download your desired model and package it as a tar.gz.
+4. Pick the model `*.tar.gz` (and any sibling files referenced by `FROM`).
+5. You need a Modelfile. Paste the Modelfile contents (or upload it as a file). Example:
    ```
    FROM DeepSeek-R1-Distill-Qwen-7B-int4-ov.tar.gz
    ModelType "OpenVINO"
@@ -32,7 +33,6 @@ Open `http://<nas-ip>:3161` in a browser:
    PARAMETER top_p 1.0
    PARAMETER temperature 1.0
    ```
-
 4. Click **Import model**. The importer stages the tar.gz into a shared volume visible to the Ollama container, rewrites the `FROM` line, and calls Ollama's `POST /api/create`. On success the model is immediately available in Open WebUI.
 
 ## Hardware requirements

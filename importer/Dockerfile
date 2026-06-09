@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 FROM golang:1.24.1-bookworm AS builder
 WORKDIR /src
-COPY main.go go.mod* ./
+COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/importer .
 
 FROM gcr.io/distroless/static-debian12:nonroot
