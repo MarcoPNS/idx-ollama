@@ -1,36 +1,52 @@
 # syntax=docker/dockerfile:1.7
 # ---------- Build stage ----------
-FROM golang:1.24.1-bookworm AS builder
+# libraries (libtbb, OpenCL ICD) that libopenvino.so / libopenvino_genai.so
+FROM ubuntu:24.04 AS builder
 
+ARG GOVERSION=1.24.1
 ARG GENAI_NIGHTLY=2026.3.0.0.dev20260516
 ARG GENAI_PKG=openvino_genai_ubuntu24_${GENAI_NIGHTLY}_x86_64
 ARG GENAI_DIR=/opt/openvino_genai
 
-WORKDIR /src
+SHELL ["/bin/bash", "-c"]
 
+# Base toolchain + Go + the system libraries the genai .so files link against.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
+        curl \
+        g++ \
+        gcc \
+        git \
+        libtbb12 \
+        ocl-icd-opencl-dev \
         wget \
     && rm -rf /var/lib/apt/lists/*
 
-RUN wget -q https://storage.openvinotoolkit.org/repositories/openvino_genai/packages/nightly/${GENAI_NIGHTLY}/${GENAI_PKG}.tar.gz \
-    && tar -xzf ${GENAI_PKG}.tar.gz \
-    && rm ${GENAI_PKG}.tar.gz
+RUN curl -fsSL https://go.dev/dl/go${GOVERSION}.linux-amd64.tar.gz \
+        | tar -xz -C /usr/local
+ENV PATH=/usr/local/go/bin:$PATH
 
-ENV GENAI_DIR=${GENAI_DIR}
-RUN mv ${GENAI_PKG} ${GENAI_DIR}
+# OpenVINO GenAI runtime headers and .so files
+RUN wget -q https://storage.openvinotoolkit.org/repositories/openvino_genai/packages/nightly/${GENAI_NIGHTLY}/${GENAI_PKG}.tar.gz -O /tmp/genai.tar.gz \
+    && tar -xzf /tmp/genai.tar.gz -C /tmp \
+    && mv /tmp/${GENAI_PKG} ${GENAI_DIR} \
+    && rm /tmp/genai.tar.gz
 
 ENV CGO_ENABLED=1
 ENV GODEBUG=cgocheck=0
 ENV CGO_CFLAGS=-I${GENAI_DIR}/runtime/include
-ENV CGO_LDFLAGS=-L${GENAI_DIR}/runtime/lib/intel64
+# -Wl,-rpath,${GENAI_DIR}/runtime/lib/intel64 bakes the genai lib dir into the
+# binary so the runtime image does not need LD_LIBRARY_PATH set to find the
+# .so files. -L points the linker at the same dir for direct linkage.
+ENV CGO_LDFLAGS="-L${GENAI_DIR}/runtime/lib/intel64 -Wl,-rpath,${GENAI_DIR}/runtime/lib/intel64 -ltbb -lOpenCL"
 ENV LD_LIBRARY_PATH=${GENAI_DIR}/runtime/lib/intel64
 ENV PATH=${GENAI_DIR}/runtime/bin/intel64:${PATH}
 
 RUN git clone --depth=1 https://github.com/zhaohb/ollama_openvino.git /src/ollama_openvino
 WORKDIR /src/ollama_openvino
-RUN go build -trimpath -ldflags="-s -w" -o /out/ollama .
+RUN mkdir -p /out \
+    && go build -trimpath -ldflags="-s -w" -o /out/ollama .
 
 # ---------- Runtime stage ----------
 FROM ubuntu:24.04 AS runtime
