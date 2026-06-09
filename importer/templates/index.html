@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Ollama OpenVINO · Model Importer</title>
+  <style>
+    :root { color-scheme: dark; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      margin: 0; padding: 2rem; max-width: 760px; margin-inline: auto;
+      background: #0f1115; color: #e6e8eb;
+    }
+    h1 { margin-top: 0; font-size: 1.6rem; }
+    .card { background: #1a1d24; border: 1px solid #2a2f3a; border-radius: 12px; padding: 1.5rem; margin: 1rem 0; }
+    label { display: block; margin: 0.75rem 0 0.25rem; font-weight: 600; }
+    input[type=text], input[type=file], textarea {
+      width: 100%; box-sizing: border-box; padding: 0.6rem 0.75rem; border-radius: 8px;
+      border: 1px solid #2a2f3a; background: #0f1115; color: #e6e8eb; font-family: inherit; font-size: 0.95rem;
+    }
+    textarea { min-height: 200px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85rem; }
+    .row { display: grid; grid-template-columns: 1fr; gap: 0.75rem; }
+    button {
+      margin-top: 1.25rem; padding: 0.75rem 1rem; font-size: 1rem; font-weight: 600;
+      background: #4f46e5; color: white; border: 0; border-radius: 8px; cursor: pointer;
+    }
+    button:hover { background: #4338ca; }
+    .alert { padding: 0.75rem 1rem; border-radius: 8px; margin: 1rem 0; }
+    .alert.ok    { background: #064e3b; color: #d1fae5; }
+    .alert.err   { background: #7f1d1d; color: #fee2e2; }
+    code { background: #0b0d12; padding: 0.1rem 0.35rem; border-radius: 4px; font-size: 0.85em; }
+    small { color: #9aa3b2; }
+  </style>
+</head>
+<body>
+  <h1>OpenVINO Model Importer</h1>
+  <p><small>Imports an OpenVINO-IR tar.gz into Ollama via <code>ollama create</code>.</small></p>
+
+  {{ if .Error }}<div class="alert err">{{ .Error }}</div>{{ end }}
+  {{ if .OK    }}<div class="alert ok">{{ .OK }}</div>{{ end }}
+
+  <form class="card" action="/upload" method="post" enctype="multipart/form-data">
+    <label>Model name (optional)</label>
+    <input type="text" name="name" value="{{ .DefaultName }}" placeholder="DeepSeek-R1-Distill-Qwen-7B-int4-ov:v1">
+    <small>If empty, the importer uses the first <code># model: name:tag</code> line of the Modelfile, or the tar.gz filename.</small>
+
+    <label>Model files (tar.gz referenced by FROM)</label>
+    <input type="file" name="files" multiple required>
+
+    <label>Modelfile</label>
+    <textarea name="modelfile_text" placeholder="FROM DeepSeek-R1-Distill-Qwen-7B-int4-ov.tar.gz
+ModelType &quot;OpenVINO&quot;
+InferDevice &quot;GPU&quot;
+PARAMETER repeat_penalty 1.0
+PARAMETER top_p 1.0
+PARAMETER temperature 1.0"></textarea>
+    <small>Paste the Modelfile contents above <em>or</em> select it as a file (use the file picker on the right).</small>
+    <input type="file" name="modelfile" accept=".modelfile,Modelfile,text/plain">
+
+    <button type="submit">Import model</button>
+  </form>
+
+  <div class="card">
+    <strong>Notes</strong>
+    <ul>
+      <li>The importer auto-rewrites the <code>FROM</code> line to a path the Ollama container can read.</li>
+      <li>The tar.gz upload must match the filename in the <code>FROM</code> line.</li>
+      <li>Maximum upload: 50 GB. For larger models, use <code>docker compose exec importer ls /uploads</code> to inspect.</li>
+    </ul>
+  </div>
+</body>
+</html>

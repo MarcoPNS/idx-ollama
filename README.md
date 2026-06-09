@@ -14,6 +14,26 @@ The bundled `docker-compose.yaml` already pulls `marcospace/idx-ollama-openvino:
 
 - Ollama API → `http://<nas-ip>:11434`
 - Open WebUI  → `http://<nas-ip>:3001`
+- **Importer** → `http://<nas-ip>:3161` (upload OpenVINO-IR models from the browser)
+
+## Importing an OpenVINO model
+
+Open `http://<nas-ip>:3161` in a browser:
+
+1. (Optional) Enter a model name, e.g. `DeepSeek-R1-Distill-Qwen-7B-int4-ov:v1`. If empty, the importer uses the first `# model: name:tag` line of the Modelfile, or falls back to the tar.gz filename.
+2. Pick the model `*.tar.gz` (and any sibling files referenced by `FROM`).
+3. Paste the Modelfile contents (or upload it as a file). Example:
+
+   ```
+   FROM DeepSeek-R1-Distill-Qwen-7B-int4-ov.tar.gz
+   ModelType "OpenVINO"
+   InferDevice "GPU"
+   PARAMETER repeat_penalty 1.0
+   PARAMETER top_p 1.0
+   PARAMETER temperature 1.0
+   ```
+
+4. Click **Import model**. The importer stages the tar.gz into a shared volume visible to the Ollama container, rewrites the `FROM` line, and calls Ollama's `POST /api/create`. On success the model is immediately available in Open WebUI.
 
 ## Hardware requirements
 
@@ -35,6 +55,6 @@ Verify with `getent group 44 105 226 261` on the host.
 
 ## Image details
 
-- Multi-stage build: Go binary compiled in `golang:1.24.1-bookworm`, then copied into a slim `ubuntu:24.04` runtime with only the OpenVINO GenAI runtime and Intel GPU/NPU userspace libraries.
-- OCI labels: `org.opencontainers.image.{source,url,vendor,description}`.
-- Runs as non-root user `ollama` (uid 1000).
+- **Ollama image** — multi-stage build: Go binary compiled in `golang:1.24.1-bookworm`, then copied into a slim `ubuntu:24.04` runtime with only the OpenVINO GenAI runtime and Intel GPU/NPU userspace libraries. Runs as non-root user `ollama` (uid 1000).
+- **Importer image** — distroless `gcr.io/distroless/static-debian12:nonroot` with a tiny Go HTTP server (no Node, no Python). Talks to Ollama over HTTP. Shares a `ollama_imports` volume with the Ollama container so the importer can drop tar.gz files where the Ollama container can read them.
+- Both images carry OCI labels (`org.opencontainers.image.{source,url,vendor,description}`).

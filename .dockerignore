@@ -8,3 +8,4 @@ openwebui_data/
 **/*.log
 **/Dockerfile
 !**/openvino/Dockerfile
+!**/importer/Dockerfile
