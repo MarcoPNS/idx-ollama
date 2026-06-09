@@ -1,0 +1,10 @@
+.git
+.gitignore
+.idea
+.vscode
+*.md
+ollama_data/
+openwebui_data/
+**/*.log
+**/Dockerfile
+!**/openvino/Dockerfile

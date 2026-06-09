@@ -1,0 +1,37 @@
+services:
+  ollama:
+    image: marcospace/idx-ollama-openvino:latest
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ./ollama_data:/home/ollama/.ollama
+    # Intel GPU + NPU passthrough
+    devices:
+      - /dev/dri:/dev/dri       # Integrated GPU (iGPU)
+      - /dev/accel:/dev/accel   # NPU
+    group_add:
+      - "44"    # video
+      - "105"   # render
+      - "261"   # accel (varies by distro)
+      - "226"   # systemd-journal (some setups)
+    environment:
+      - OLLAMA_HOST=0.0.0.0:11434
+    restart: always
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    ports:
+      - "3001:8080"
+    volumes:
+      - ./openwebui_data:/app/backend/data
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: always
+
+volumes:
+  ollama_data:
+  openwebui_data:
