@@ -2,16 +2,21 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"html/template"
 	"io"
 	"log"
 	"mime/multipart"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
 
 const indexTpl = `<!doctype html>
@@ -34,55 +39,160 @@ const indexTpl = `<!doctype html>
       width: 100%; box-sizing: border-box; padding: 0.6rem 0.75rem; border-radius: 8px;
       border: 1px solid #2a2f3a; background: #0f1115; color: #e6e8eb; font-family: inherit; font-size: 0.95rem;
     }
-    textarea { min-height: 200px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85rem; }
+    textarea { min-height: 180px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85rem; }
     button {
       margin-top: 1.25rem; padding: 0.75rem 1rem; font-size: 1rem; font-weight: 600;
       background: #4f46e5; color: white; border: 0; border-radius: 8px; cursor: pointer;
     }
     button:hover { background: #4338ca; }
+    button:disabled { background: #3a3f4b; cursor: not-allowed; }
     .alert { padding: 0.75rem 1rem; border-radius: 8px; margin: 1rem 0; }
     .alert.ok    { background: #064e3b; color: #d1fae5; }
     .alert.err   { background: #7f1d1d; color: #fee2e2; }
     code { background: #0b0d12; padding: 0.1rem 0.35rem; border-radius: 4px; font-size: 0.85em; }
     small { color: #9aa3b2; }
+    .progress { width: 100%; height: 18px; background: #0b0d12; border: 1px solid #2a2f3a; border-radius: 6px; overflow: hidden; margin-top: .5rem; }
+    .progress > div { height: 100%; background: #4f46e5; width: 0%; transition: width .2s; }
+    .status { margin-top: .5rem; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .85rem; }
   </style>
 </head>
 <body>
   <h1>OpenVINO Model Importer</h1>
-  <p><small>Imports an OpenVINO-IR tar.gz into Ollama via <code>ollama create</code>.</small></p>
+  <p><small>Imports an OpenVINO-IR tar.gz into Ollama via <code>ollama create</code>. Large files are uploaded in chunks so they survive slow links and timeouts.</small></p>
 
-  {{ if .Error }}<div class="alert err">{{ .Error }}</div>{{ end }}
-  {{ if .OK    }}<div class="alert ok">{{ .OK }}</div>{{ end }}
-
-  <form class="card" action="/upload" method="post" enctype="multipart/form-data">
+  <form class="card" id="imp">
     <label>Model name (optional)</label>
-    <input type="text" name="name" value="{{ .DefaultName }}" placeholder="DeepSeek-R1-Distill-Qwen-7B-int4-ov:v1">
+    <input type="text" id="name" placeholder="DeepSeek-R1-Distill-Qwen-7B-int4-ov:v1">
     <small>If empty, the importer uses the first <code># model: name:tag</code> line of the Modelfile, or the tar.gz filename.</small>
 
-    <label>Model files (tar.gz referenced by FROM)</label>
-    <input type="file" name="files" multiple required>
+    <label>Model file (the tar.gz referenced by FROM)</label>
+    <input type="file" id="file" required>
 
     <label>Modelfile</label>
-    <textarea name="modelfile_text" placeholder="FROM DeepSeek-R1-Distill-Qwen-7B-int4-ov.tar.gz
+    <textarea id="modelfile" placeholder="FROM DeepSeek-R1-Distill-Qwen-7B-int4-ov.tar.gz
 ModelType &quot;OpenVINO&quot;
 InferDevice &quot;GPU&quot;
 PARAMETER repeat_penalty 1.0
 PARAMETER top_p 1.0
 PARAMETER temperature 1.0"></textarea>
-    <small>Paste the Modelfile contents above <em>or</em> select it as a file (use the file picker on the right).</small>
-    <input type="file" name="modelfile" accept=".modelfile,Modelfile,text/plain">
 
-    <button type="submit">Import model</button>
+    <button type="submit" id="go">Import model</button>
+    <div class="progress" id="barWrap" style="display:none"><div id="bar"></div></div>
+    <div class="status" id="status"></div>
   </form>
 
   <div class="card">
     <strong>Notes</strong>
     <ul>
-      <li>The importer auto-rewrites the <code>FROM</code> line to a path the Ollama container can read.</li>
-      <li>The tar.gz upload must match the filename in the <code>FROM</code> line.</li>
-      <li>Maximum upload: 50 GB.</li>
+      <li>Upload size: 32 MiB chunks, retried automatically on failure.</li>
+      <li>You can close this tab during the upload; reopen it and the import will continue when the importer is reachable again.</li>
+      <li>The Modelfile's <code>FROM</code> line is auto-rewritten to a path the Ollama container can read.</li>
     </ul>
   </div>
+
+<script>
+const CHUNK = 32 * 1024 * 1024;
+
+const $ = (s) => document.querySelector(s);
+const form = $("#imp");
+const fileInput = $("#file");
+const nameInput = $("#name");
+const modelfileInput = $("#modelfile");
+const goBtn = $("#go");
+const bar = $("#bar");
+const barWrap = $("#barWrap");
+const statusEl = $("#status");
+
+function setStatus(html, cls) {
+  statusEl.innerHTML = html;
+  statusEl.className = "status " + (cls || "");
+}
+
+function fmtBytes(n) {
+  const u = ["B","KiB","MiB","GiB","TiB"];
+  let i = 0;
+  while (n >= 1024 && i < u.length-1) { n /= 1024; i++; }
+  return n.toFixed(n >= 10 ? 0 : 1) + " " + u[i];
+}
+
+async function postJSON(url, body) {
+  const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const t = await r.text();
+  if (!r.ok) throw new Error("HTTP " + r.status + ": " + t);
+  return JSON.parse(t);
+}
+
+async function putBytes(url, blob) {
+  const r = await fetch(url, { method: "PUT", headers: { "Content-Type": "application/octet-stream" }, body: blob });
+  if (!r.ok) throw new Error("PUT " + r.status + ": " + await r.text());
+}
+
+async function pollJob(id) {
+  const start = Date.now();
+  while (true) {
+    const r = await fetch("/jobs/" + id);
+    if (!r.ok) throw new Error("status " + r.status);
+    const j = await r.json();
+    if (j.status === "done")   { return j; }
+    if (j.status === "error")  { throw new Error(j.message || "import failed"); }
+    if (Date.now() - start > 30 * 60 * 1000) throw new Error("timeout waiting for ollama create");
+    await new Promise(r => setTimeout(r, 1000));
+  }
+}
+
+async function uploadWithRetry(url, blob, attempts = 6) {
+  for (let i = 0; i < attempts; i++) {
+    try { await putBytes(url, blob); return; }
+    catch (e) {
+      if (i === attempts - 1) throw e;
+      await new Promise(r => setTimeout(r, 500 * (i + 1)));
+    }
+  }
+}
+
+form.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  goBtn.disabled = true;
+  barWrap.style.display = "block";
+  bar.style.width = "0%";
+  setStatus("Creating job…");
+
+  try {
+    const file = fileInput.files[0];
+    if (!file) throw new Error("pick a file");
+    const modelfile = modelfileInput.value.trim();
+    if (!modelfile) throw new Error("paste a Modelfile");
+
+    const job = await postJSON("/jobs", {
+      name: nameInput.value.trim(),
+      modelfile: modelfile,
+      filename: file.name,
+      size: file.size
+    });
+
+    setStatus("Uploading " + job.totalChunks + " chunks…");
+    let sent = 0;
+    for (let i = 0; i < job.totalChunks; i++) {
+      const start = i * CHUNK;
+      const end = Math.min(start + CHUNK, file.size);
+      const blob = file.slice(start, end);
+      await uploadWithRetry("/jobs/" + job.id + "/chunks/" + i, blob);
+      sent += end - start;
+      const pct = file.size > 0 ? (sent / file.size * 100) : 100;
+      bar.style.width = pct.toFixed(1) + "%";
+      setStatus("Uploading chunk " + (i + 1) + " / " + job.totalChunks + " · " + fmtBytes(sent) + " / " + fmtBytes(file.size));
+    }
+
+    setStatus("Finalizing and importing into Ollama…");
+    const done = await pollJob(job.id);
+    setStatus('<div class="alert ok">Imported <code>' + done.name + '</code></div>', "ok");
+  } catch (err) {
+    setStatus('<div class="alert err">' + (err.message || err) + '</div>', "err");
+  } finally {
+    goBtn.disabled = false;
+  }
+});
+</script>
 </body>
 </html>`
 
@@ -91,7 +201,35 @@ var (
 	ollamaURL   = getenv("OLLAMA_URL", "http://ollama:11434")
 	uploadDir   = getenv("UPLOAD_DIR", "/uploads")
 	modelsInOll = getenv("MODELS_IN_OLLAMA", "/models/imports")
-	maxUpload   = int64(50) << 30 // 50 GiB
+	chunkSize   = int64(32) << 20 // 32 MiB
+)
+
+type jobStatus string
+
+const (
+	statusPending   jobStatus = "pending"
+	statusUploading jobStatus = "uploading"
+	statusCreating  jobStatus = "creating"
+	statusDone      jobStatus = "done"
+	statusError     jobStatus = "error"
+)
+
+type job struct {
+	ID         string    `json:"id"`
+	Name       string    `json:"name,omitempty"`
+	Filename   string    `json:"filename"`
+	Size       int64     `json:"size"`
+	ChunkSize  int64     `json:"chunkSize"`
+	TotalChunks int64    `json:"totalChunks"`
+	Modelfile  string    `json:"-"`
+	Status     jobStatus `json:"status"`
+	Message    string    `json:"message,omitempty"`
+	CreatedAt  time.Time `json:"createdAt"`
+}
+
+var (
+	jobsMu sync.Mutex
+	jobs   = map[string]*job{}
 )
 
 func main() {
@@ -100,8 +238,9 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
-	mux.Handle("/", http.HandlerFunc(handleIndex))
-	mux.HandleFunc("/upload", handleUpload)
+	mux.HandleFunc("/", handleIndex)
+	mux.HandleFunc("/jobs", handleCreateJob)
+	mux.HandleFunc("/jobs/", handleJobAction)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("ok"))
 	})
@@ -117,93 +256,234 @@ func getenv(k, def string) string {
 	return def
 }
 
-type pageData struct {
-	DefaultName string
-	Error       string
-	OK          string
-}
+type pageData struct{}
 
-func handleIndex(w http.ResponseWriter, r *http.Request) {
+func handleIndex(w http.ResponseWriter, _ *http.Request) {
 	tpl := template.Must(template.New("index").Parse(indexTpl))
-	_ = tpl.Execute(w, pageData{
-		DefaultName: r.URL.Query().Get("name"),
-		Error:       r.URL.Query().Get("error"),
-		OK:          r.URL.Query().Get("ok"),
-	})
+	_ = tpl.Execute(w, pageData{})
 }
 
-func handleUpload(w http.ResponseWriter, r *http.Request) {
+func newID() string {
+	b := make([]byte, 8)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+// --- /jobs (POST) ---
+
+type createJobReq struct {
+	Name      string `json:"name"`
+	Modelfile string `json:"modelfile"`
+	Filename  string `json:"filename"`
+	Size      int64  `json:"size"`
+}
+
+func handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, maxUpload+1<<20)
-
-	if err := r.ParseMultipartForm(maxUpload + 1<<20); err != nil {
-		redirect(w, r, "/?error="+url.QueryEscape(err.Error()))
+	var req createJobReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.Filename == "" || req.Size <= 0 {
+		http.Error(w, "filename and size required", http.StatusBadRequest)
+		return
+	}
+	if strings.TrimSpace(req.Modelfile) == "" {
+		http.Error(w, "modelfile required", http.StatusBadRequest)
+		return
+	}
+	if _, err := extractFromPath(req.Modelfile); err != nil {
+		http.Error(w, "modelfile: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	modelfileRaw, err := readModelfile(r)
-	if err != nil {
-		redirect(w, r, "/?error="+url.QueryEscape(err.Error()))
+	j := &job{
+		ID:          newID(),
+		Name:        strings.TrimSpace(req.Name),
+		Filename:    filepath.Base(req.Filename),
+		Size:        req.Size,
+		ChunkSize:   chunkSize,
+		TotalChunks: (req.Size + chunkSize - 1) / chunkSize,
+		Modelfile:   req.Modelfile,
+		Status:      statusPending,
+		CreatedAt:   time.Now(),
+	}
+	if err := os.MkdirAll(filepath.Join(uploadDir, j.ID), 0o755); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	jobsMu.Lock()
+	jobs[j.ID] = j
+	jobsMu.Unlock()
 
-	fromPath, fromErr := extractFromPath(modelfileRaw)
-	if fromErr != nil {
-		redirect(w, r, "/?error="+url.QueryEscape(fromErr.Error()))
-		return
-	}
-
-	uploadedName, found := findUploadedFile(r, filepath.Base(fromPath))
-	if !found {
-		redirect(w, r, "/?error="+url.QueryEscape(
-			"uploaded files do not include "+filepath.Base(fromPath)+
-				" (referenced in the Modelfile's FROM line)"))
-		return
-	}
-
-	stagedDir := filepath.Join(modelsInOll, sanitizeName(strings.TrimSuffix(uploadedName, filepath.Ext(uploadedName))))
-	if err := os.MkdirAll(stagedDir, 0o755); err != nil {
-		redirect(w, r, "/?error="+url.QueryEscape(err.Error()))
-		return
-	}
-	dst := filepath.Join(stagedDir, uploadedName)
-	if err := moveUploadedFile(filepath.Join(uploadDir, uploadedName), dst); err != nil {
-		redirect(w, r, "/?error="+url.QueryEscape(err.Error()))
-		return
-	}
-
-	rewritten := rewriteFrom(modelfileRaw, dst)
-
-	modelName := strings.TrimSpace(r.FormValue("name"))
-	if modelName == "" {
-		modelName = deriveModelName(modelfileRaw, uploadedName)
-	}
-	if modelName == "" {
-		redirect(w, r, "/?error="+url.QueryEscape("could not derive model name; add a '# model: name:tag' line to the Modelfile or set the name field"))
-		return
-	}
-
-	if err := ollamaCreate(modelName, rewritten); err != nil {
-		redirect(w, r, "/?error=ollama+create+failed%3A+"+url.QueryEscape(err.Error()))
-		return
-	}
-
-	redirect(w, r, "/?ok="+url.QueryEscape("imported "+modelName))
+	writeJSON(w, http.StatusCreated, j)
 }
 
-func readModelfile(r *http.Request) (string, error) {
-	if f, _, err := r.FormFile("modelfile"); err == nil {
-		defer f.Close()
-		b, _ := io.ReadAll(f)
-		return string(b), nil
+// --- /jobs/{id}/... ---
+
+func handleJobAction(w http.ResponseWriter, r *http.Request) {
+	// Trim leading /jobs/ and split.
+	rest := strings.TrimPrefix(r.URL.Path, "/jobs/")
+	parts := strings.SplitN(rest, "/", 2)
+	if len(parts) == 0 || parts[0] == "" {
+		http.NotFound(w, r)
+		return
 	}
-	if v := strings.TrimSpace(r.FormValue("modelfile_text")); v != "" {
-		return v, nil
+	id := parts[0]
+	verb := ""
+	if len(parts) == 2 {
+		verb = parts[1]
 	}
-	return "", fmt.Errorf("missing Modelfile (upload a file or paste contents)")
+
+	jobsMu.Lock()
+	j, ok := jobs[id]
+	jobsMu.Unlock()
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+
+	switch {
+	case verb == "" && r.Method == http.MethodGet:
+		writeJSON(w, http.StatusOK, j)
+	case strings.HasPrefix(verb, "chunks/") && r.Method == http.MethodPut:
+		nStr := strings.TrimPrefix(verb, "chunks/")
+		n, err := strconv.ParseInt(nStr, 10, 64)
+		if err != nil {
+			http.Error(w, "bad chunk index", http.StatusBadRequest)
+			return
+		}
+		handlePutChunk(w, r, j, n)
+	case verb == "finalize" && r.Method == http.MethodPost:
+		handleFinalize(w, r, j)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func handlePutChunk(w http.ResponseWriter, r *http.Request, j *job, n int64) {
+	if n < 0 || n >= j.TotalChunks {
+		http.Error(w, "chunk out of range", http.StatusBadRequest)
+		return
+	}
+	expected := j.ChunkSize
+	if n == j.TotalChunks-1 {
+		expected = j.Size - n*j.ChunkSize
+	}
+	if r.ContentLength > 0 && r.ContentLength != expected {
+		http.Error(w, fmt.Sprintf("chunk size %d != expected %d", r.ContentLength, expected), http.StatusBadRequest)
+		return
+	}
+
+	path := filepath.Join(uploadDir, j.ID, fmt.Sprintf("part-%08d", n))
+	tmp := path + ".tmp"
+	f, err := os.Create(tmp)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	n2, err := io.Copy(f, r.Body)
+	_ = f.Close()
+	if err != nil {
+		_ = os.Remove(tmp)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if n2 != expected {
+		_ = os.Remove(tmp)
+		http.Error(w, fmt.Sprintf("short chunk: got %d expected %d", n2, expected), http.StatusBadRequest)
+		return
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func handleFinalize(w http.ResponseWriter, r *http.Request, j *job) {
+	jobsMu.Lock()
+	if j.Status == statusDone || j.Status == statusCreating {
+		jobsMu.Unlock()
+		writeJSON(w, http.StatusOK, j)
+		return
+	}
+	j.Status = statusCreating
+	jobsMu.Unlock()
+
+	go func() {
+		if err := assembleAndImport(j); err != nil {
+			jobsMu.Lock()
+			j.Status = statusError
+			j.Message = err.Error()
+			jobsMu.Unlock()
+			log.Printf("job %s: %v", j.ID, err)
+			return
+		}
+		jobsMu.Lock()
+		j.Status = statusDone
+		j.Message = "imported " + j.Name
+		jobsMu.Unlock()
+		log.Printf("job %s: done -> %s", j.ID, j.Name)
+	}()
+	writeJSON(w, http.StatusAccepted, j)
+}
+
+func assembleAndImport(j *job) error {
+	assembled := filepath.Join(uploadDir, j.ID, j.Filename)
+	out, err := os.Create(assembled)
+	if err != nil {
+		return err
+	}
+	for n := int64(0); n < j.TotalChunks; n++ {
+		part := filepath.Join(uploadDir, j.ID, fmt.Sprintf("part-%08d", n))
+		in, err := os.Open(part)
+		if err != nil {
+			out.Close()
+			return fmt.Errorf("missing chunk %d: %w", n, err)
+		}
+		_, err = io.Copy(out, in)
+		in.Close()
+		if err != nil {
+			out.Close()
+			return err
+		}
+	}
+	if err := out.Close(); err != nil {
+		return err
+	}
+
+	// Stage into the shared volume visible to the ollama container.
+	stagedDir := filepath.Join(modelsInOll, sanitizeName(stripExt(j.Filename)))
+	if err := os.MkdirAll(stagedDir, 0o755); err != nil {
+		return err
+	}
+	staged := filepath.Join(stagedDir, j.Filename)
+	if err := moveFile(assembled, staged); err != nil {
+		return err
+	}
+
+	// Resolve model name
+	name := j.Name
+	if name == "" {
+		name = deriveModelName(j.Modelfile, j.Filename)
+	}
+	if name == "" {
+		return fmt.Errorf("could not derive model name; add '# model: name:tag' to the Modelfile or set the name field")
+	}
+
+	rewritten := rewriteFrom(j.Modelfile, staged)
+	if err := ollamaCreate(name, rewritten); err != nil {
+		return err
+	}
+	j.Name = name
+	return nil
 }
 
 func extractFromPath(mf string) (string, error) {
@@ -224,56 +504,6 @@ func extractFromPath(mf string) (string, error) {
 		return path, nil
 	}
 	return "", fmt.Errorf("Modelfile is empty")
-}
-
-func findUploadedFile(r *http.Request, want string) (string, bool) {
-	for _, fh := range r.MultipartForm.File["files"] {
-		safe := filepath.Base(fh.Filename)
-		if safe != want {
-			continue
-		}
-		if err := saveUpload(fh, filepath.Join(uploadDir, safe)); err != nil {
-			return "", false
-		}
-		return safe, true
-	}
-	return "", false
-}
-
-func saveUpload(fh *multipart.FileHeader, dst string) error {
-	src, err := fh.Open()
-	if err != nil {
-		return err
-	}
-	defer src.Close()
-	out, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-	_, err = io.Copy(out, src)
-	return err
-}
-
-func moveUploadedFile(src, dst string) error {
-	if err := os.Rename(src, dst); err == nil {
-		return nil
-	}
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	out, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-	if _, err := io.Copy(out, in); err != nil {
-		return err
-	}
-	_ = os.Remove(src)
-	return nil
 }
 
 func rewriteFrom(mf, newPath string) string {
@@ -302,7 +532,7 @@ func deriveModelName(mf, fallback string) string {
 			return strings.TrimSpace(trim[len("# model:"):])
 		}
 	}
-	base := strings.TrimSuffix(fallback, filepath.Ext(fallback))
+	base := stripExt(fallback)
 	if i := strings.Index(base, "-int4-ov"); i > 0 {
 		base = base[:i]
 	}
@@ -312,15 +542,9 @@ func deriveModelName(mf, fallback string) string {
 func ollamaCreate(name, modelfile string) error {
 	body := &bytes.Buffer{}
 	mw := multipart.NewWriter(body)
-	if err := mw.WriteField("name", name); err != nil {
-		return err
-	}
-	if err := mw.WriteField("modelfile", modelfile); err != nil {
-		return err
-	}
-	if err := mw.WriteField("stream", "false"); err != nil {
-		return err
-	}
+	_ = mw.WriteField("name", name)
+	_ = mw.WriteField("modelfile", modelfile)
+	_ = mw.WriteField("stream", "false")
 	_ = mw.Close()
 
 	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(ollamaURL, "/")+"/api/create", body)
@@ -357,6 +581,32 @@ func sanitizeName(s string) string {
 	return string(out)
 }
 
-func redirect(w http.ResponseWriter, r *http.Request, to string) {
-	http.Redirect(w, r, to, http.StatusSeeOther)
+func stripExt(s string) string {
+	return strings.TrimSuffix(s, filepath.Ext(s))
+}
+
+func moveFile(src, dst string) error {
+	if err := os.Rename(src, dst); err == nil {
+		return nil
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+	return os.Remove(src)
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
 }
